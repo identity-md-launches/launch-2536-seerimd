@@ -17,8 +17,13 @@ contract SeerIMDHandler is Test {
     constructor(address[4] memory actors_) {
         actors = actors_;
         token = new SeerIMD();
-        require(token.transfer(actors[0], SUPPLY), "initial distribution failed");
-        expectedBalance[actors[0]] = SUPPLY;
+        // Fund every actor so randomized calls exercise nonzero transfers from the outset.
+        for (uint256 i; i < actors.length; ++i) {
+            require(
+                token.transfer(actors[i], SUPPLY / actors.length), "initial distribution failed"
+            );
+            expectedBalance[actors[i]] = SUPPLY / actors.length;
+        }
     }
 
     function transfer(uint256 fromSeed, uint256 toSeed, uint256 amountSeed) external {
@@ -35,9 +40,11 @@ contract SeerIMDHandler is Test {
         address owner = _actor(ownerSeed);
         address spender = _actor(spenderSeed);
         uint256 amount;
-        if (amountSeed % 4 == 1) {
+        if (amountSeed % 5 == 1) {
             amount = type(uint256).max;
-        } else if (amountSeed % 4 > 1) {
+        } else if (amountSeed % 5 == 2) {
+            amount = type(uint256).max - 1;
+        } else if (amountSeed % 5 > 2) {
             amount = bound(amountSeed, 0, SUPPLY);
         }
         vm.prank(owner);
@@ -88,7 +95,13 @@ contract SeerIMDHandler is Test {
         address spender = _actor(spenderSeed);
         address to = _actor(toSeed);
         uint256 approved = expectedAllowance[owner][spender];
-        if (approved == type(uint256).max) return;
+        // An infinite approval cannot be exceeded: revoke it before trying an unauthorized spend.
+        if (approved == type(uint256).max) {
+            vm.prank(owner);
+            assertTrue(token.approve(spender, 0));
+            expectedAllowance[owner][spender] = 0;
+            approved = 0;
+        }
         vm.expectRevert(
             abi.encodeWithSelector(
                 IERC20Errors.ERC20InsufficientAllowance.selector, spender, approved, approved + 1
@@ -98,11 +111,91 @@ contract SeerIMDHandler is Test {
         token.transferFrom(owner, to, approved + 1);
     }
 
+    function rejectInsufficientBalanceWithApproval(
+        uint256 ownerSeed,
+        uint256 spenderSeed,
+        uint256 toSeed,
+        uint256 excessSeed,
+        bool infinite
+    ) external {
+        address owner = _actor(ownerSeed);
+        address spender = _actor(spenderSeed);
+        uint256 balance = expectedBalance[owner];
+        uint256 amount = balance + bound(excessSeed, 1, SUPPLY);
+        uint256 approved = infinite ? type(uint256).max : amount;
+        vm.prank(owner);
+        assertTrue(token.approve(spender, approved));
+        expectedAllowance[owner][spender] = approved;
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IERC20Errors.ERC20InsufficientBalance.selector, owner, balance, amount
+            )
+        );
+        vm.prank(spender);
+        token.transferFrom(owner, _actor(toSeed), amount);
+        // The global model checks that a failed spend did not consume this approval.
+    }
+
+    function rejectZeroRecipient(uint256 ownerSeed, uint256 spenderSeed, uint256 amountSeed)
+        external
+    {
+        address owner = _actor(ownerSeed);
+        address spender = _actor(spenderSeed);
+        uint256 approved = expectedAllowance[owner][spender];
+        uint256 maximum = expectedBalance[owner] < approved ? expectedBalance[owner] : approved;
+        uint256 amount = bound(amountSeed, 0, maximum);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InvalidReceiver.selector, address(0))
+        );
+        vm.prank(spender);
+        token.transferFrom(owner, address(0), amount);
+
+        uint256 directAmount = bound(amountSeed, 0, expectedBalance[owner]);
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InvalidReceiver.selector, address(0))
+        );
+        vm.prank(owner);
+        token.transfer(address(0), directAmount);
+    }
+
+    function rejectZeroSpender(uint256 ownerSeed, uint256 amount) external {
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InvalidSpender.selector, address(0))
+        );
+        vm.prank(_actor(ownerSeed));
+        token.approve(address(0), amount);
+    }
+
+    function roundTrip(uint256 fromSeed, uint256 toSeed, uint256 amountSeed) external {
+        address from = _actor(fromSeed);
+        address to = _actor(toSeed);
+        uint256 amount = bound(amountSeed, 0, expectedBalance[from]);
+        uint256 fromBefore = token.balanceOf(from);
+        uint256 toBefore = token.balanceOf(to);
+
+        vm.prank(from);
+        assertTrue(token.transfer(to, amount));
+        if (from != to) {
+            assertEq(token.balanceOf(from), fromBefore - amount);
+            assertEq(token.balanceOf(to), toBefore + amount);
+        }
+        vm.prank(to);
+        assertTrue(token.transfer(from, amount));
+        assertEq(token.balanceOf(from), fromBefore);
+        assertEq(token.balanceOf(to), toBefore);
+        // No ghost change: a round trip must preserve balances and every approval.
+    }
+
     function _actor(uint256 seed) private view returns (address) {
         return actors[seed % actors.length];
     }
 }
 
+/// forge-config: default.invariant.runs = 256
+/// forge-config: default.invariant.depth = 128
+/// forge-config: default.invariant.fail-on-revert = true
 contract SeerIMDInvariantTest is Test {
     uint256 private constant SUPPLY = 1_000_000_000 * 1e18;
     address[4] private actors;
@@ -115,12 +208,16 @@ contract SeerIMDInvariantTest is Test {
         handler = new SeerIMDHandler(actors);
         token = handler.token();
 
-        bytes4[] memory selectors = new bytes4[](5);
+        bytes4[] memory selectors = new bytes4[](9);
         selectors[0] = handler.transfer.selector;
         selectors[1] = handler.approve.selector;
         selectors[2] = handler.transferFrom.selector;
         selectors[3] = handler.rejectOverspend.selector;
         selectors[4] = handler.rejectUnapprovedSpend.selector;
+        selectors[5] = handler.rejectInsufficientBalanceWithApproval.selector;
+        selectors[6] = handler.rejectZeroRecipient.selector;
+        selectors[7] = handler.rejectZeroSpender.selector;
+        selectors[8] = handler.roundTrip.selector;
         targetContract(address(handler));
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
     }
@@ -141,6 +238,8 @@ contract SeerIMDInvariantTest is Test {
 
     function invariantAllowancesMatchModel() public view {
         for (uint256 i; i < actors.length; ++i) {
+            assertEq(token.allowance(actors[i], address(0)), 0);
+            assertEq(token.allowance(address(0), actors[i]), 0);
             for (uint256 j; j < actors.length; ++j) {
                 assertEq(
                     token.allowance(actors[i], actors[j]),
@@ -148,5 +247,12 @@ contract SeerIMDInvariantTest is Test {
                 );
             }
         }
+    }
+
+    function invariantMetadataNeverChanges() public view {
+        assertEq(token.name(), "SeerIMD");
+        assertEq(token.symbol(), "SEER");
+        assertEq(token.decimals(), 18);
+        assertEq(token.INITIAL_SUPPLY(), SUPPLY);
     }
 }
